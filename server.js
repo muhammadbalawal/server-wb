@@ -28,7 +28,8 @@ const wss = new WebSocket.Server({
     // Extract path to determine track type
     const url = new URL(info.req.url, 'http://localhost');
     info.req.trackType = url.pathname === '/inbound' ? 'inbound_track' : 
-                        url.pathname === '/outbound' ? 'outbound_track' : 'unknown';
+                        url.pathname === '/outbound' ? 'outbound_track' : 
+                        url.pathname === '/frontend' ? 'frontend' : 'unknown';
     return true;
   }
 });
@@ -38,6 +39,9 @@ const connections = new Map();
 
 // Store conversation buffers by call SID
 const conversationBuffers = new Map();
+
+// Store frontend connections for callSid updates
+const frontendConnections = new Set();
 
 // Function to save transcript to Supabase
 async function saveTranscriptToSupabase(callSid, speaker, transcript) {
@@ -107,6 +111,22 @@ function flushConversation(callSid) {
   }
 }
 
+// Function to send callSid to all frontend connections
+function sendCallSidToFrontend(callSid) {
+  const callStartedMessage = JSON.stringify({
+    type: 'call_started',
+    callSid: callSid
+  });
+  
+  console.log(`�� Sending callSid to ${frontendConnections.size} frontend connections: ${callSid}`);
+  
+  frontendConnections.forEach(frontendWs => {
+    if (frontendWs.readyState === WebSocket.OPEN) {
+      frontendWs.send(callStartedMessage);
+    }
+  });
+}
+
 function createDeepgramConnection(label, callSid, trackType, streamSid) {
   const deepgramUrl = `wss://api.deepgram.com/v1/listen?` + new URLSearchParams({
     encoding: 'mulaw',
@@ -164,7 +184,7 @@ function createDeepgramConnection(label, callSid, trackType, streamSid) {
   });
   
   deepgramWs.on("close", () => {
-    console.log(`🔒 Deepgram WebSocket closed for ${label}`);
+    console.log(`�� Deepgram WebSocket closed for ${label}`);
   });
   
   deepgramWs.on("error", (err) => {
@@ -181,8 +201,33 @@ function createDeepgramConnection(label, callSid, trackType, streamSid) {
 
 wss.on("connection", (ws, req) => {
   const trackType = req.trackType || 'unknown';
-  console.log(`🔌 New Twilio Media Stream Connected - Track: ${trackType}`);
+  console.log(`🔌 New WebSocket Connection - Track: ${trackType}`);
   
+  // Handle frontend connections
+  if (trackType === 'frontend') {
+    console.log('🖥️ Frontend connected for callSid updates');
+    frontendConnections.add(ws);
+    
+    ws.on("close", () => {
+      console.log('🔴 Frontend disconnected');
+      frontendConnections.delete(ws);
+    });
+    
+    ws.on("error", (err) => {
+      console.error('❌ Frontend WebSocket error:', err);
+      frontendConnections.delete(ws);
+    });
+    
+    // Send a welcome message
+    ws.send(JSON.stringify({
+      type: 'connected',
+      message: 'Frontend connected successfully'
+    }));
+    
+    return; // Don't process as Twilio media stream
+  }
+  
+  // Handle Twilio media stream connections
   let callSid = null;
   let streamSid = null;
   let deepgramConnection = null;
@@ -223,6 +268,9 @@ wss.on("connection", (ws, req) => {
         });
         
         console.log(`🎙️ Live transcription started for ${streamLabel}`);
+        
+        // Send callSid to all frontend connections
+        sendCallSidToFrontend(callSid);
       }
       
       if (msg.event === "media" && msg.media && deepgramConnection) {
@@ -236,7 +284,7 @@ wss.on("connection", (ws, req) => {
       }
       
       if (msg.event === "stop") {
-        console.log(`🛑 Stream stopped for ${callSid} - Track: ${trackType}`);
+        console.log(`�� Stream stopped for ${callSid} - Track: ${trackType}`);
         
         // Clean up this specific connection
         const connectionKey = `${callSid}-${trackType}`;
@@ -296,6 +344,7 @@ server.listen(PORT, () => {
   console.log(`✅ WebSocket server listening on port ${PORT}`);
   console.log(`🎙️ Ready to handle dual stream transcription:`);
   console.log(`   📞 CALLER (inbound_track) - Real-time caller audio`);
-  console.log(`   📱 CALLEE (outbound_track) - Real-time callee audio`);
+  console.log(`   �� CALLEE (outbound_track) - Real-time callee audio`);
+  console.log(`   🖥️ Frontend (/frontend) - CallSid updates`);
   console.log(`💾 Transcriptions will be saved to Supabase`);
 });
