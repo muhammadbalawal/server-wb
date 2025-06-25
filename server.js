@@ -126,4 +126,5 @@ server.listen(PORT, () => {
   console.log(`✅ WebSocket server listening on port ${PORT}`);
   console.log(`🎙️ Live transcription: Shows caller's voice in real-time`);
   console.log(`🎬 Full conversation: Available via recording webhook after call ends`);
+  
 });
