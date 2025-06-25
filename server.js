@@ -1,3 +1,4 @@
+// File: websocket-server.js
 require("dotenv").config();
 const http = require("http");
 const WebSocket = require("ws");
@@ -61,9 +62,9 @@ wss.on("connection", (ws) => {
         
         if (result && result.transcript) {
           if (response.is_final) {
-            console.log(`📝 [FINAL] ${result.transcript}`);
+            console.log(`📝 [LIVE - CALLER] ${result.transcript}`);
           } else {
-            console.log(`🔄 [INTERIM] ${result.transcript}`);
+            console.log(`🔄 [LIVE - CALLER] ${result.transcript}`);
           }
         }
       }
@@ -88,6 +89,7 @@ wss.on("connection", (ws) => {
       if (msg.event === "start" && msg.start) {
         callSid = msg.start.callSid;
         console.log(`🎯 Call started: ${callSid}`);
+        console.log(`🎙️ Live transcription (caller only) - Full conversation will be available after call ends`);
       }
       
       if (msg.event === "media" && msg.media) {
@@ -102,6 +104,7 @@ wss.on("connection", (ws) => {
       
       if (msg.event === "stop") {
         console.log(`🛑 Stream stopped for ${callSid}`);
+        console.log(`⏳ Waiting for recording to complete for full conversation transcript...`);
       }
       
     } catch (err) {
@@ -121,4 +124,6 @@ wss.on("connection", (ws) => {
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`✅ WebSocket server listening on port ${PORT}`);
+  console.log(`🎙️ Live transcription: Shows caller's voice in real-time`);
+  console.log(`🎬 Full conversation: Available via recording webhook after call ends`);
 });
