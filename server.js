@@ -2,13 +2,24 @@
 require("dotenv").config();
 const http = require("http");
 const WebSocket = require("ws");
+const { createClient } = require('@supabase/supabase-js');
 
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
 if (!DEEPGRAM_API_KEY) {
   console.error("❌ Please set DEEPGRAM_API_KEY in your environment");
   process.exit(1);
 }
+
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+  console.error("❌ Please set SUPABASE_URL and SUPABASE_ANON_KEY in your environment");
+  process.exit(1);
+}
+
+// Initialize Supabase client
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 const server = http.createServer();
 const wss = new WebSocket.Server({ 
@@ -25,7 +36,30 @@ const wss = new WebSocket.Server({
 // Store connections by call SID and track type
 const connections = new Map();
 
-function createDeepgramConnection(label) {
+// Function to save transcript to Supabase
+async function saveTranscriptToSupabase(callSid, speaker, transcript) {
+  try {
+    const { error } = await supabase
+      .from('transcriptions')
+      .insert([
+        {
+          call_sid: callSid,
+          speaker: speaker,
+          transcript: transcript
+        }
+      ]);
+
+    if (error) {
+      console.error('❌ Error saving to Supabase:', error);
+    } else {
+      console.log(`💾 Saved: [${speaker}] ${transcript.substring(0, 50)}...`);
+    }
+  } catch (err) {
+    console.error('❌ Exception saving to Supabase:', err);
+  }
+}
+
+function createDeepgramConnection(label, callSid, trackType, streamSid) {
   const deepgramUrl = `wss://api.deepgram.com/v1/listen?` + new URLSearchParams({
     encoding: 'mulaw',
     sample_rate: 8000,
@@ -69,6 +103,8 @@ function createDeepgramConnection(label) {
         if (result && result.transcript) {
           if (response.is_final) {
             console.log(`📝 [${label}] ${result.transcript}`);
+            // Save only final transcripts to Supabase
+            saveTranscriptToSupabase(callSid, label, result.transcript);
           } else {
             console.log(`🔄 [${label}] ${result.transcript}`);
           }
@@ -100,6 +136,7 @@ wss.on("connection", (ws, req) => {
   console.log(`🔌 New Twilio Media Stream Connected - Track: ${trackType}`);
   
   let callSid = null;
+  let streamSid = null;
   let deepgramConnection = null;
   
   // Handle Twilio messages
@@ -109,7 +146,7 @@ wss.on("connection", (ws, req) => {
       
       if (msg.event === "start" && msg.start) {
         callSid = msg.start.callSid;
-        const streamSid = msg.start.streamSid;
+        streamSid = msg.start.streamSid;
         
         console.log(`🎯 Call started: ${callSid} - Stream: ${streamSid} - Track: ${trackType}`);
         
@@ -124,7 +161,7 @@ wss.on("connection", (ws, req) => {
         }
         
         // Create Deepgram connection for this stream
-        deepgramConnection = createDeepgramConnection(streamLabel);
+        deepgramConnection = createDeepgramConnection(streamLabel, callSid, trackType, streamSid);
         
         // Store connection info
         const connectionKey = `${callSid}-${trackType}`;
@@ -133,7 +170,8 @@ wss.on("connection", (ws, req) => {
           deepgramConnection,
           streamLabel,
           callSid,
-          trackType
+          trackType,
+          streamSid
         });
         
         console.log(`🎙️ Live transcription started for ${streamLabel}`);
@@ -202,4 +240,5 @@ server.listen(PORT, () => {
   console.log(`🎙️ Ready to handle dual stream transcription:`);
   console.log(`   📞 CALLER (inbound_track) - Real-time caller audio`);
   console.log(`   📱 CALLEE (outbound_track) - Real-time callee audio`);
+  console.log(`💾 Transcriptions will be saved to Supabase`);
 });
