@@ -13,12 +13,10 @@ if (!DEEPGRAM_API_KEY) {
 const server = http.createServer();
 const wss = new WebSocket.Server({ server });
 
-wss.on("connection", (ws) => {
-  console.log("🔌 Twilio Media Stream Connected");
-  
-  let callSid = null;
-  
-  // Deepgram WebSocket URL
+// Store connections by call SID and track type
+const connections = new Map();
+
+function createDeepgramConnection(label) {
   const deepgramUrl = `wss://api.deepgram.com/v1/listen?` + new URLSearchParams({
     encoding: 'mulaw',
     sample_rate: 8000,
@@ -30,7 +28,6 @@ wss.on("connection", (ws) => {
     language: 'en-US'
   }).toString();
   
-  // Connect to Deepgram
   const deepgramWs = new WebSocket(deepgramUrl, {
     headers: {
       'Authorization': `Token ${DEEPGRAM_API_KEY}`
@@ -41,7 +38,7 @@ wss.on("connection", (ws) => {
   const audioQueue = [];
   
   deepgramWs.on("open", () => {
-    console.log("✅ Connected to Deepgram");
+    console.log(`✅ Connected to Deepgram for ${label}`);
     isDeepgramOpen = true;
     
     // Send any queued audio
@@ -62,24 +59,39 @@ wss.on("connection", (ws) => {
         
         if (result && result.transcript) {
           if (response.is_final) {
-            console.log(`📝 [LIVE - CALLER] ${result.transcript}`);
+            console.log(`📝 [${label}] ${result.transcript}`);
           } else {
-            console.log(`🔄 [LIVE - CALLER] ${result.transcript}`);
+            console.log(`🔄 [${label}] ${result.transcript}`);
           }
         }
       }
     } catch (err) {
-      console.error("❌ Failed to process Deepgram message:", err);
+      console.error(`❌ Failed to process Deepgram message for ${label}:`, err);
     }
   });
   
   deepgramWs.on("close", () => {
-    console.log("🔒 Deepgram WebSocket closed");
+    console.log(`🔒 Deepgram WebSocket closed for ${label}`);
   });
   
   deepgramWs.on("error", (err) => {
-    console.error("❌ Deepgram WebSocket error:", err);
+    console.error(`❌ Deepgram WebSocket error for ${label}:`, err);
   });
+  
+  return {
+    deepgramWs,
+    isDeepgramOpen: () => isDeepgramOpen,
+    audioQueue,
+    setOpen: (status) => { isDeepgramOpen = status; }
+  };
+}
+
+wss.on("connection", (ws) => {
+  console.log("🔌 New Twilio Media Stream Connected");
+  
+  let callSid = null;
+  let trackType = null;
+  let deepgramConnection = null;
   
   // Handle Twilio messages
   ws.on("message", (data) => {
@@ -88,23 +100,66 @@ wss.on("connection", (ws) => {
       
       if (msg.event === "start" && msg.start) {
         callSid = msg.start.callSid;
-        console.log(`🎯 Call started: ${callSid}`);
-        console.log(`🎙️ Live transcription (caller only) - Full conversation will be available after call ends`);
+        trackType = msg.start.mediaFormat?.track || 'unknown';
+        
+        console.log(`🎯 Call started: ${callSid} - Track: ${trackType}`);
+        
+        // Determine the label for this stream
+        let streamLabel;
+        if (trackType === 'inbound_track') {
+          streamLabel = 'CALLER';
+        } else if (trackType === 'outbound_track') {
+          streamLabel = 'CALLEE';
+        } else {
+          streamLabel = `UNKNOWN-${trackType}`;
+        }
+        
+        // Create Deepgram connection for this stream
+        deepgramConnection = createDeepgramConnection(streamLabel);
+        
+        // Store connection info
+        const connectionKey = `${callSid}-${trackType}`;
+        connections.set(connectionKey, {
+          ws,
+          deepgramConnection,
+          streamLabel,
+          callSid,
+          trackType
+        });
+        
+        console.log(`🎙️ Live transcription started for ${streamLabel}`);
       }
       
-      if (msg.event === "media" && msg.media) {
+      if (msg.event === "media" && msg.media && deepgramConnection) {
         const audioBuffer = Buffer.from(msg.media.payload, 'base64');
         
-        if (isDeepgramOpen && deepgramWs.readyState === WebSocket.OPEN) {
-          deepgramWs.send(audioBuffer);
+        if (deepgramConnection.isDeepgramOpen() && deepgramConnection.deepgramWs.readyState === WebSocket.OPEN) {
+          deepgramConnection.deepgramWs.send(audioBuffer);
         } else {
-          audioQueue.push(audioBuffer);
+          deepgramConnection.audioQueue.push(audioBuffer);
         }
       }
       
       if (msg.event === "stop") {
-        console.log(`🛑 Stream stopped for ${callSid}`);
-        console.log(`⏳ Waiting for recording to complete for full conversation transcript...`);
+        console.log(`🛑 Stream stopped for ${callSid} - Track: ${trackType}`);
+        
+        // Clean up this specific connection
+        const connectionKey = `${callSid}-${trackType}`;
+        const connectionInfo = connections.get(connectionKey);
+        
+        if (connectionInfo && connectionInfo.deepgramConnection) {
+          if (connectionInfo.deepgramConnection.deepgramWs.readyState === WebSocket.OPEN) {
+            connectionInfo.deepgramConnection.deepgramWs.close();
+          }
+        }
+        
+        connections.delete(connectionKey);
+        
+        // Check if this was the last connection for this call
+        const remainingConnections = Array.from(connections.keys()).filter(key => key.startsWith(callSid));
+        if (remainingConnections.length === 0) {
+          console.log(`✅ All streams ended for call ${callSid}`);
+        }
       }
       
     } catch (err) {
@@ -113,17 +168,29 @@ wss.on("connection", (ws) => {
   });
   
   ws.on("close", () => {
-    console.log("🔴 Twilio Media Stream Disconnected");
+    console.log(`🔴 Twilio Media Stream Disconnected - Call: ${callSid}, Track: ${trackType}`);
     
-    if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) {
-      deepgramWs.close();
+    // Clean up Deepgram connection
+    if (deepgramConnection && deepgramConnection.deepgramWs.readyState === WebSocket.OPEN) {
+      deepgramConnection.deepgramWs.close();
     }
+    
+    // Remove from connections map
+    if (callSid && trackType) {
+      const connectionKey = `${callSid}-${trackType}`;
+      connections.delete(connectionKey);
+    }
+  });
+  
+  ws.on("error", (err) => {
+    console.error(`❌ WebSocket error for ${callSid}-${trackType}:`, err);
   });
 });
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`✅ WebSocket server listening on port ${PORT}`);
-  console.log(`🎙️ Live transcription: Shows caller's voice in real-time`);
-  console.log(`🎬 Full conversation: Available via recording webhook after call ends`);
+  console.log(`🎙️ Ready to handle dual stream transcription:`);
+  console.log(`   📞 CALLER (inbound_track) - Real-time caller audio`);
+  console.log(`   📱 CALLEE (outbound_track) - Real-time callee audio`);
 });
