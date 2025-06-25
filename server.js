@@ -36,6 +36,9 @@ const wss = new WebSocket.Server({
 // Store connections by call SID and track type
 const connections = new Map();
 
+// Store conversation buffers by call SID
+const conversationBuffers = new Map();
+
 // Function to save transcript to Supabase
 async function saveTranscriptToSupabase(callSid, speaker, transcript) {
   try {
@@ -45,7 +48,7 @@ async function saveTranscriptToSupabase(callSid, speaker, transcript) {
         {
           call_sid: callSid,
           speaker: speaker,
-          transcript: transcript
+          transcript: transcript.trim()
         }
       ]);
 
@@ -56,6 +59,51 @@ async function saveTranscriptToSupabase(callSid, speaker, transcript) {
     }
   } catch (err) {
     console.error('❌ Exception saving to Supabase:', err);
+  }
+}
+
+// Function to handle conversation turns
+function handleConversationTurn(callSid, currentSpeaker, transcript) {
+  if (!conversationBuffers.has(callSid)) {
+    conversationBuffers.set(callSid, {
+      currentSpeaker: null,
+      buffer: '',
+      lastActivity: Date.now()
+    });
+  }
+
+  const conversation = conversationBuffers.get(callSid);
+  
+  // If speaker changed or this is the first message
+  if (conversation.currentSpeaker !== currentSpeaker) {
+    // Save the previous speaker's complete turn (if exists)
+    if (conversation.currentSpeaker && conversation.buffer.trim()) {
+      saveTranscriptToSupabase(callSid, conversation.currentSpeaker, conversation.buffer);
+    }
+    
+    // Start new turn
+    conversation.currentSpeaker = currentSpeaker;
+    conversation.buffer = transcript + ' ';
+  } else {
+    // Same speaker continuing - append to buffer
+    conversation.buffer += transcript + ' ';
+  }
+  
+  conversation.lastActivity = Date.now();
+}
+
+// Function to flush any remaining conversation when call ends
+function flushConversation(callSid) {
+  if (conversationBuffers.has(callSid)) {
+    const conversation = conversationBuffers.get(callSid);
+    
+    // Save any remaining buffered content
+    if (conversation.currentSpeaker && conversation.buffer.trim()) {
+      saveTranscriptToSupabase(callSid, conversation.currentSpeaker, conversation.buffer);
+    }
+    
+    // Clean up
+    conversationBuffers.delete(callSid);
   }
 }
 
@@ -103,8 +151,8 @@ function createDeepgramConnection(label, callSid, trackType, streamSid) {
         if (result && result.transcript) {
           if (response.is_final) {
             console.log(`📝 [${label}] ${result.transcript}`);
-            // Save only final transcripts to Supabase
-            saveTranscriptToSupabase(callSid, label, result.transcript);
+            // Buffer the transcript by conversation turns
+            handleConversationTurn(callSid, label, result.transcript);
           } else {
             console.log(`🔄 [${label}] ${result.transcript}`);
           }
@@ -206,6 +254,8 @@ wss.on("connection", (ws, req) => {
         const remainingConnections = Array.from(connections.keys()).filter(key => key.startsWith(callSid));
         if (remainingConnections.length === 0) {
           console.log(`✅ All streams ended for call ${callSid}`);
+          // Flush any remaining conversation when call completely ends
+          flushConversation(callSid);
         }
       }
       
@@ -226,6 +276,13 @@ wss.on("connection", (ws, req) => {
     if (callSid && trackType) {
       const connectionKey = `${callSid}-${trackType}`;
       connections.delete(connectionKey);
+      
+      // Check if this was the last connection for this call
+      const remainingConnections = Array.from(connections.keys()).filter(key => key.startsWith(callSid));
+      if (remainingConnections.length === 0) {
+        // Flush any remaining conversation when call completely ends
+        flushConversation(callSid);
+      }
     }
   });
   
