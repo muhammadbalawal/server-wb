@@ -11,7 +11,16 @@ if (!DEEPGRAM_API_KEY) {
 }
 
 const server = http.createServer();
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ 
+  server,
+  verifyClient: (info) => {
+    // Extract path to determine track type
+    const url = new URL(info.req.url, 'http://localhost');
+    info.req.trackType = url.pathname === '/inbound' ? 'inbound_track' : 
+                        url.pathname === '/outbound' ? 'outbound_track' : 'unknown';
+    return true;
+  }
+});
 
 // Store connections by call SID and track type
 const connections = new Map();
@@ -86,11 +95,11 @@ function createDeepgramConnection(label) {
   };
 }
 
-wss.on("connection", (ws) => {
-  console.log("🔌 New Twilio Media Stream Connected");
+wss.on("connection", (ws, req) => {
+  const trackType = req.trackType || 'unknown';
+  console.log(`🔌 New Twilio Media Stream Connected - Track: ${trackType}`);
   
   let callSid = null;
-  let trackType = null;
   let deepgramConnection = null;
   
   // Handle Twilio messages
@@ -100,9 +109,9 @@ wss.on("connection", (ws) => {
       
       if (msg.event === "start" && msg.start) {
         callSid = msg.start.callSid;
-        trackType = msg.start.mediaFormat?.track || 'unknown';
+        const streamSid = msg.start.streamSid;
         
-        console.log(`🎯 Call started: ${callSid} - Track: ${trackType}`);
+        console.log(`🎯 Call started: ${callSid} - Stream: ${streamSid} - Track: ${trackType}`);
         
         // Determine the label for this stream
         let streamLabel;
