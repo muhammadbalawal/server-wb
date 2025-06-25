@@ -1,130 +1,226 @@
-// File: websocket-server.js
-require("dotenv").config();
-const http = require("http");
-const WebSocket = require("ws");
+const WebSocket = require('ws');
+const axios = require('axios');
 
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
+class TranscriptionServer {
+  constructor(port = 8080) {
+    this.port = port;
+    this.wss = new WebSocket.Server({ 
+      port: this.port,
+      path: '/audio-stream'
+    });
+    this.callSessions = new Map();
+    this.deepgramUrl = 'wss://api.deepgram.com/v1/listen';
+    
+    this.setupWebSocketHandlers();
+    console.log(`🚀 WebSocket server running on port ${this.port}`);
+  }
 
-if (!DEEPGRAM_API_KEY) {
-  console.error("❌ Please set DEEPGRAM_API_KEY in your environment");
-  process.exit(1);
+  setupWebSocketHandlers() {
+    this.wss.on('connection', (ws, request) => {
+      console.log('🔌 New WebSocket connection established');
+      
+      const callSid = this.extractCallSid(request.url);
+      if (!callSid) {
+        console.error('❌ No CallSid found in WebSocket URL');
+        ws.close();
+        return;
+      }
+
+      // Store call session
+      this.callSessions.set(callSid, {
+        callSid,
+        ws,
+        transcriptBuffer: []
+      });
+
+      console.log(`📞 Call session started for: ${callSid}`);
+
+      // Connect to Deepgram
+      this.connectToDeepgram(callSid);
+
+      // Handle incoming audio data
+      ws.on('message', (data) => {
+        this.handleAudioData(callSid, data);
+      });
+
+      // Handle connection close
+      ws.on('close', () => {
+        console.log(`📞 Call session ended for: ${callSid}`);
+        this.disconnectFromDeepgram(callSid);
+        this.callSessions.delete(callSid);
+      });
+
+      // Handle errors
+      ws.on('error', (error) => {
+        console.error(`❌ WebSocket error for call ${callSid}:`, error);
+        this.disconnectFromDeepgram(callSid);
+        this.callSessions.delete(callSid);
+      });
+    });
+  }
+
+  extractCallSid(url) {
+    if (!url) return null;
+    const urlParams = new URLSearchParams(url.split('?')[1]);
+    return urlParams.get('callSid');
+  }
+
+  connectToDeepgram(callSid) {
+    const session = this.callSessions.get(callSid);
+    if (!session) return;
+
+    // Deepgram connection parameters
+    const params = new URLSearchParams({
+      model: 'nova-2',
+      language: 'en-US',
+      punctuate: 'true',
+      smart_format: 'true',
+      diarize: 'true',
+      interim_results: 'true',
+      endpointing: '200'
+    });
+
+    const deepgramWs = new WebSocket(`${this.deepgramUrl}?${params.toString()}`, {
+      headers: {
+        'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`
+      }
+    });
+
+    deepgramWs.onopen = () => {
+      console.log(`🔗 Connected to Deepgram for call: ${callSid}`);
+      session.deepgramConnection = deepgramWs;
+    };
+
+    deepgramWs.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        this.handleDeepgramResponse(callSid, data);
+      } catch (error) {
+        console.error('Error parsing Deepgram response:', error);
+      }
+    };
+
+    deepgramWs.onerror = (error) => {
+      console.error(`❌ Deepgram error for call ${callSid}:`, error);
+    };
+
+    deepgramWs.onclose = () => {
+      console.log(`🔗 Deepgram connection closed for call: ${callSid}`);
+    };
+  }
+
+  disconnectFromDeepgram(callSid) {
+    const session = this.callSessions.get(callSid);
+    if (session?.deepgramConnection) {
+      session.deepgramConnection.close();
+      session.deepgramConnection = undefined;
+    }
+  }
+
+  handleAudioData(callSid, audioData) {
+    const session = this.callSessions.get(callSid);
+    if (!session?.deepgramConnection) {
+      console.error(`❌ No Deepgram connection for call: ${callSid}`);
+      return;
+    }
+
+    // Send audio data to Deepgram
+    if (session.deepgramConnection.readyState === WebSocket.OPEN) {
+      session.deepgramConnection.send(audioData);
+    }
+  }
+
+  handleDeepgramResponse(callSid, data) {
+    const session = this.callSessions.get(callSid);
+    if (!session) return;
+
+    if (data.type === 'Results') {
+      const results = data.channel?.alternatives?.[0];
+      if (!results) return;
+
+      const transcript = results.transcript;
+      const confidence = results.confidence || 0;
+      const isFinal = !data.is_final;
+
+      if (transcript && transcript.trim()) {
+        const transcriptMessage = {
+          transcript: transcript.trim(),
+          confidence,
+          timestamp: Date.now()
+        };
+
+        // Add speaker information if available
+        if (data.speaker !== undefined) {
+          transcriptMessage.speaker = data.speaker;
+        }
+
+        if (isFinal) {
+          // Final result
+          session.transcriptBuffer.push(transcriptMessage);
+          this.broadcastTranscript(callSid, transcriptMessage);
+          console.log(`📝 [${callSid}] Final transcript: ${transcriptMessage.transcript}`);
+        } else {
+          // Interim result
+          transcriptMessage.isInterim = true;
+          this.broadcastInterimTranscript(callSid, transcriptMessage);
+        }
+      }
+    }
+  }
+
+  broadcastTranscript(callSid, message) {
+    const session = this.callSessions.get(callSid);
+    if (session && session.ws.readyState === WebSocket.OPEN) {
+      session.ws.send(JSON.stringify({
+        type: 'transcript',
+        callSid,
+        data: message
+      }));
+    }
+  }
+
+  broadcastInterimTranscript(callSid, message) {
+    const session = this.callSessions.get(callSid);
+    if (session && session.ws.readyState === WebSocket.OPEN) {
+      session.ws.send(JSON.stringify({
+        type: 'interim',
+        callSid,
+        data: message
+      }));
+    }
+  }
+
+  getTranscriptHistory(callSid) {
+    const session = this.callSessions.get(callSid);
+    return session ? session.transcriptBuffer : [];
+  }
+
+  close() {
+    // Close all Deepgram connections
+    for (const [callSid] of this.callSessions) {
+      this.disconnectFromDeepgram(callSid);
+    }
+    this.wss.close();
+  }
 }
 
-const server = http.createServer();
-const wss = new WebSocket.Server({ server });
+// Start the server if this file is run directly
+if (require.main === module) {
+  const port = process.env.WEBSOCKET_PORT || 8080;
+  const server = new TranscriptionServer(port);
 
-wss.on("connection", (ws) => {
-  console.log("🔌 Twilio Media Stream Connected");
-  
-  let callSid = null;
-  
-  // Deepgram WebSocket URL
-  const deepgramUrl = `wss://api.deepgram.com/v1/listen?` + new URLSearchParams({
-    encoding: 'mulaw',
-    sample_rate: 8000,
-    channels: 1,
-    punctuate: true,
-    interim_results: true,
-    smart_format: true,
-    model: 'nova-2',
-    language: 'en-US'
-  }).toString();
-  
-  // Connect to Deepgram
-  const deepgramWs = new WebSocket(deepgramUrl, {
-    headers: {
-      'Authorization': `Token ${DEEPGRAM_API_KEY}`
-    }
+  // Graceful shutdown
+  process.on('SIGINT', () => {
+    console.log('🛑 Shutting down WebSocket server...');
+    server.close();
+    process.exit(0);
   });
-  
-  let isDeepgramOpen = false;
-  const audioQueue = [];
-  
-  deepgramWs.on("open", () => {
-    console.log("✅ Connected to Deepgram");
-    isDeepgramOpen = true;
-    
-    // Send any queued audio
-    while (audioQueue.length > 0) {
-      const audioData = audioQueue.shift();
-      if (deepgramWs.readyState === WebSocket.OPEN) {
-        deepgramWs.send(audioData);
-      }
-    }
-  });
-  
-  deepgramWs.on("message", (message) => {
-    try {
-      const response = JSON.parse(message);
-      
-      if (response.type === 'Results') {
-        const result = response.channel?.alternatives?.[0];
-        
-        if (result && result.transcript) {
-          if (response.is_final) {
-            console.log(`📝 [LIVE - CALLER] ${result.transcript}`);
-          } else {
-            console.log(`🔄 [LIVE - CALLER] ${result.transcript}`);
-          }
-        }
-      }
-    } catch (err) {
-      console.error("❌ Failed to process Deepgram message:", err);
-    }
-  });
-  
-  deepgramWs.on("close", () => {
-    console.log("🔒 Deepgram WebSocket closed");
-  });
-  
-  deepgramWs.on("error", (err) => {
-    console.error("❌ Deepgram WebSocket error:", err);
-  });
-  
-  // Handle Twilio messages
-  ws.on("message", (data) => {
-    try {
-      const msg = JSON.parse(data);
-      
-      if (msg.event === "start" && msg.start) {
-        callSid = msg.start.callSid;
-        console.log(`🎯 Call started: ${callSid}`);
-        console.log(`🎙️ Live transcription (caller only) - Full conversation will be available after call ends`);
-      }
-      
-      if (msg.event === "media" && msg.media) {
-        const audioBuffer = Buffer.from(msg.media.payload, 'base64');
-        
-        if (isDeepgramOpen && deepgramWs.readyState === WebSocket.OPEN) {
-          deepgramWs.send(audioBuffer);
-        } else {
-          audioQueue.push(audioBuffer);
-        }
-      }
-      
-      if (msg.event === "stop") {
-        console.log(`🛑 Stream stopped for ${callSid}`);
-        console.log(`⏳ Waiting for recording to complete for full conversation transcript...`);
-      }
-      
-    } catch (err) {
-      console.error("❌ Failed to parse Twilio message:", err);
-    }
-  });
-  
-  ws.on("close", () => {
-    console.log("🔴 Twilio Media Stream Disconnected");
-    
-    if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) {
-      deepgramWs.close();
-    }
-  });
-});
 
-const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-  console.log(`✅ WebSocket server listening on port ${PORT}`);
-  console.log(`🎙️ Live transcription: Shows caller's voice in real-time`);
-  console.log(`🎬 Full conversation: Available via recording webhook after call ends`);
-  
-});
+  process.on('SIGTERM', () => {
+    console.log('🛑 Terminating WebSocket server...');
+    server.close();
+    process.exit(0);
+  });
+}
+
+module.exports = TranscriptionServer; 
