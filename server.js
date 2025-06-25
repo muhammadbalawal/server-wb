@@ -11,21 +11,62 @@ if (!DEEPGRAM_API_KEY) {
 }
 
 const server = http.createServer();
+
+// Main WebSocket server for Twilio media streams
 const wss = new WebSocket.Server({ 
   server,
   verifyClient: (info) => {
-    // Extract path to determine track type
+    // Only accept connections that are NOT to the /transcript path
     const url = new URL(info.req.url, 'http://localhost');
+    if (url.pathname === '/transcript') {
+      return false; // Let the transcript server handle this
+    }
+    
+    // Extract path to determine track type
     info.req.trackType = url.pathname === '/inbound' ? 'inbound_track' : 
                         url.pathname === '/outbound' ? 'outbound_track' : 'unknown';
     return true;
   }
 });
 
+// Separate WebSocket server for transcript clients
+const transcriptWss = new WebSocket.Server({ 
+  server,
+  path: '/transcript'
+});
+
 // Store connections by call SID and track type
 const connections = new Map();
 
-function createDeepgramConnection(label) {
+// Store client connections for transcript broadcasting
+const transcriptClients = new Map(); // callSid -> Set of client WebSockets
+
+// Function to broadcast transcript to clients
+function broadcastTranscript(callSid, speaker, transcript, isFinal) {
+  if (transcriptClients.has(callSid)) {
+    const message = JSON.stringify({
+      type: 'transcript',
+      speaker: speaker,
+      transcript: transcript,
+      isFinal: isFinal,
+      timestamp: new Date().toISOString()
+    });
+    
+    const clients = transcriptClients.get(callSid);
+    clients.forEach(clientWs => {
+      if (clientWs.readyState === WebSocket.OPEN) {
+        try {
+          clientWs.send(message);
+          console.log(`📤 Sent transcript to client: [${speaker}] ${transcript.substring(0, 50)}...`);
+        } catch (err) {
+          console.error('❌ Failed to send transcript to client:', err);
+        }
+      }
+    });
+  }
+}
+
+function createDeepgramConnection(label, callSid) {
   const deepgramUrl = `wss://api.deepgram.com/v1/listen?` + new URLSearchParams({
     encoding: 'mulaw',
     sample_rate: 8000,
@@ -69,8 +110,12 @@ function createDeepgramConnection(label) {
         if (result && result.transcript) {
           if (response.is_final) {
             console.log(`📝 [${label}] ${result.transcript}`);
+            // Broadcast final transcript to clients
+            broadcastTranscript(callSid, label, result.transcript, true);
           } else {
             console.log(`🔄 [${label}] ${result.transcript}`);
+            // Broadcast interim transcript to clients
+            broadcastTranscript(callSid, label, result.transcript, false);
           }
         }
       }
@@ -95,6 +140,7 @@ function createDeepgramConnection(label) {
   };
 }
 
+// Handle Twilio media stream connections
 wss.on("connection", (ws, req) => {
   const trackType = req.trackType || 'unknown';
   console.log(`🔌 New Twilio Media Stream Connected - Track: ${trackType}`);
@@ -124,7 +170,7 @@ wss.on("connection", (ws, req) => {
         }
         
         // Create Deepgram connection for this stream
-        deepgramConnection = createDeepgramConnection(streamLabel);
+        deepgramConnection = createDeepgramConnection(streamLabel, callSid);
         
         // Store connection info
         const connectionKey = `${callSid}-${trackType}`;
@@ -168,6 +214,20 @@ wss.on("connection", (ws, req) => {
         const remainingConnections = Array.from(connections.keys()).filter(key => key.startsWith(callSid));
         if (remainingConnections.length === 0) {
           console.log(`✅ All streams ended for call ${callSid}`);
+          
+          // Clean up transcript clients for this call
+          if (transcriptClients.has(callSid)) {
+            const clients = transcriptClients.get(callSid);
+            clients.forEach(clientWs => {
+              if (clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(JSON.stringify({
+                  type: 'call_ended',
+                  callSid: callSid
+                }));
+              }
+            });
+            transcriptClients.delete(callSid);
+          }
         }
       }
       
@@ -196,10 +256,95 @@ wss.on("connection", (ws, req) => {
   });
 });
 
+// Handle transcript client connections
+transcriptWss.on("connection", (clientWs, req) => {
+  console.log("📱 Transcript client connected");
+  
+  let clientCallSid = null;
+  
+  // Send welcome message
+  clientWs.send(JSON.stringify({
+    type: 'connected',
+    message: 'Connected to transcript server'
+  }));
+  
+  clientWs.on("message", (data) => {
+    try {
+      const msg = JSON.parse(data);
+      
+      if (msg.type === 'register' && msg.callSid) {
+        clientCallSid = msg.callSid;
+        
+        // Add client to the call's transcript clients
+        if (!transcriptClients.has(clientCallSid)) {
+          transcriptClients.set(clientCallSid, new Set());
+        }
+        transcriptClients.get(clientCallSid).add(clientWs);
+        
+        console.log(`📱 Client registered for call ${clientCallSid}`);
+        
+        // Send confirmation
+        clientWs.send(JSON.stringify({
+          type: 'registered',
+          callSid: clientCallSid,
+          message: `Registered for call ${clientCallSid}`
+        }));
+      }
+      
+      if (msg.type === 'ping') {
+        // Respond to ping with pong
+        clientWs.send(JSON.stringify({
+          type: 'pong'
+        }));
+      }
+      
+    } catch (err) {
+      console.error("❌ Failed to parse client message:", err);
+    }
+  });
+  
+  clientWs.on("close", () => {
+    console.log("📱 Transcript client disconnected");
+    
+    // Remove client from all call subscriptions
+    if (clientCallSid && transcriptClients.has(clientCallSid)) {
+      transcriptClients.get(clientCallSid).delete(clientWs);
+      
+      // Clean up empty sets
+      if (transcriptClients.get(clientCallSid).size === 0) {
+        transcriptClients.delete(clientCallSid);
+        console.log(`📱 No more clients for call ${clientCallSid}`);
+      }
+    }
+  });
+  
+  clientWs.on("error", (err) => {
+    console.error("❌ Transcript client WebSocket error:", err);
+  });
+});
+
+// Health check endpoint
+server.on('request', (req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'healthy',
+      connections: connections.size,
+      transcriptClients: Array.from(transcriptClients.keys()).length,
+      timestamp: new Date().toISOString()
+    }));
+  } else {
+    res.writeHead(404);
+    res.end('Not Found');
+  }
+});
+
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`✅ WebSocket server listening on port ${PORT}`);
   console.log(`🎙️ Ready to handle dual stream transcription:`);
   console.log(`   📞 CALLER (inbound_track) - Real-time caller audio`);
   console.log(`   📱 CALLEE (outbound_track) - Real-time callee audio`);
+  console.log(`   📡 Transcript broadcasting - Live transcripts to clients`);
+  console.log(`   🏥 Health check available at: http://localhost:${PORT}/health`);
 });
